@@ -20,6 +20,11 @@
 #include <fuse.h>
 
 /*
+   Debug
+*/
+//#define DEBUG
+
+/*
    Paths
 */
 
@@ -129,7 +134,7 @@ enc_dec_block_sequence(uint8_t *blocks, size_t size,
     assert(size % (BLOCK_SIZE) == 0);
 
     for(i = 0; i < size; i += (BLOCK_SIZE)) {
-	ctr_key_for_block(block_key, main_key, nonce, first_block_num + i);
+	ctr_key_for_block(block_key, main_key, nonce, first_block_num + (i/(BLOCK_SIZE)));
 	ctr_xor_block((uint64_t *)&blocks[i], (uint64_t *)block_key);
     }
 }
@@ -143,15 +148,35 @@ enc_dec_block_sequence(uint8_t *blocks, size_t size,
 static int
 read_block_sequence(uint8_t *blocks, size_t size,
 		     uint64_t first_block_num) {
+    size_t ret = 0, count = 0;
+
     fseek(encrypted_fp, first_block_num * (BLOCK_SIZE), SEEK_SET);
-    return fread(blocks, 1, size, encrypted_fp);
+
+    do {
+        ret = fread(blocks + count, 1, size - count, encrypted_fp);
+        if(ret == -1) return ret;	
+
+        count += ret;
+    } while (count != size);
+
+    return count;
 }
 
 static int
 write_block_sequence(const uint8_t *blocks, size_t size,
 		     uint64_t first_block_num) {
+    size_t ret = 0, count = 0;
+
     fseek(encrypted_fp, first_block_num * (BLOCK_SIZE), SEEK_SET);
-    return fwrite(blocks, 1, size, encrypted_fp);    
+
+    do {
+        ret = fwrite(blocks + count, 1, size - count, encrypted_fp); 
+        if(ret == -1) return ret;	
+
+        count += ret;
+    } while (count != size);
+
+    return count;
 }
 
 /*
@@ -202,6 +227,11 @@ open_callback(const char *path, struct fuse_file_info *fi) {
 static int
 read_callback(const char *path, char *buf, size_t size,
 	      off_t offset, struct fuse_file_info *fi) {
+
+#ifdef DEBUG
+    fprintf(stderr, "read_callback(path=\"%s\", buf=0x%08x, size=%d, offset=%lld, fi=0x%08x)\n",
+	    path,  (int) buf, size,  offset,  (int) fi);
+#endif
     
     if (strcmp(path, "/" PLAIN_FILENAME) == 0) {
 
@@ -226,13 +256,13 @@ read_callback(const char *path, char *buf, size_t size,
 	uint8_t blocks[MAX_BLOCK_SEQUENCE_SIZE + (BLOCK_SIZE)];
 
 	uint64_t first_block_num = offset / (BLOCK_SIZE);
-    	size_t seq_size = size;
+    	size_t seq_size = size + (offset % (BLOCK_SIZE));
 
 	/* fill extra bytes to obtain a sequence length
 	   which is a multiple of the block size */
 	
-	if(size % (BLOCK_SIZE) != 0)
-	    seq_size += (BLOCK_SIZE) - (size % (BLOCK_SIZE));
+	if((offset + size) % (BLOCK_SIZE) != 0)
+	    seq_size += (BLOCK_SIZE) - ((offset + size) % (BLOCK_SIZE));
 
 	/* read sequence of blocks */
 	
@@ -261,17 +291,22 @@ static int
 write_callback(const char *path, const char *buf, size_t size,
 	       off_t offset, struct fuse_file_info *fi) {
 
+#ifdef DEBUG
+    fprintf(stderr, "write_callback(path=\"%s\", buf=0x%08x, size=%d, offset=%lld, fi=0x%08x)\n",
+	    path,  (int) buf, size,  offset,  (int) fi);
+#endif
+
     if (strcmp(path, "/" PLAIN_FILENAME) == 0) {
 
         off_t len = encrypted_stat.st_size - sizeof(nonce);
 
 	if (offset >= len) {
-	    return 0;
+	    return -1;
     	}
 
 	if (offset + size > len) {
 	    size = len - offset;
-	    if(!size) return 0;
+	    if(!size) return -1;
 	}
 
 	if(size > MAX_BLOCK_SEQUENCE_SIZE) {
@@ -284,13 +319,18 @@ write_callback(const char *path, const char *buf, size_t size,
     	uint8_t blocks[MAX_BLOCK_SEQUENCE_SIZE + (BLOCK_SIZE)];
 
 	uint64_t first_block_num = offset / (BLOCK_SIZE);
-    	size_t seq_size = size;
+    	size_t seq_size = size + (offset % (BLOCK_SIZE));
 
 	/* fill extra bytes to obtain a sequence length
 	   which is a multiple of the block size */
+	
+	if((offset + size) % (BLOCK_SIZE) != 0)
+	    seq_size += (BLOCK_SIZE) - ((offset + size) % (BLOCK_SIZE));
 
-	if(size % (BLOCK_SIZE) != 0)
-	    seq_size += (BLOCK_SIZE) - (size % (BLOCK_SIZE));
+#ifdef DEBUG
+        fprintf(stderr, "write_callback() params: seq_size=\"%d\", first_block=\"%d\"\n",
+	    seq_size, first_block_num);
+#endif
 
 	/* read sequence of blocks */
 	
@@ -299,7 +339,7 @@ write_callback(const char *path, const char *buf, size_t size,
 	    fprintf(stderr,
 		    "read_block_sequence(): read only %d out of %d bytes",
 		    ret, seq_size);
-	    return 0;
+	    return -1;
 	}
 
 	/* decrypt sequence of blocks */
@@ -321,7 +361,7 @@ write_callback(const char *path, const char *buf, size_t size,
 	    fprintf(stderr,
 		    "write_block_sequence(): written only %d out of %d bytes",
 		    ret, seq_size);
-	    return 0;
+	    return -1;
 	}
 
 	return size;
@@ -348,7 +388,7 @@ main(int argc, char *argv[])
     char *passphrase = NULL;
     
     if(argc < 3) {
-	fprintf(stderr, "usage: %s encrypted_file mount_point/\n", argv[0]);
+	fprintf(stderr, "usage: %s encrypted_file mount_point/ [-fsd]\n", argv[0]);
 	return 0;
     }
 
