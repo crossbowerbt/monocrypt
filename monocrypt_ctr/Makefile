@@ -6,4 +6,4 @@ LDFLAGS=`pkg-config --libs fuse openssl`
 PROGNAME=monocrypt_ctr
 
 all:
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(PROGNAME) $(PROGNAME).c
+	$(CC) -pedantic -Wall $(CFLAGS) $(LDFLAGS) -o $(PROGNAME) $(PROGNAME).c
