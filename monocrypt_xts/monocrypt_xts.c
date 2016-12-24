@@ -20,12 +20,17 @@
 #include <fuse.h>
 
 /*
-  Encryption/decryption flags
+  Modes of operation for the various functions in the program
 */
 
 enum {
     MODE_DECRYPT = 0,
     MODE_ENCRYPT = 1
+};
+
+enum {
+    MODE_READ = 0,
+    MODE_WRITE = 1
 };
 
 /*
@@ -230,14 +235,16 @@ enc_dec_wide_block_sequence(uint8_t *blocks, size_t size,
 
 static int
 read_block_sequence(uint8_t *blocks, size_t size,
-                    uint64_t first_block_num) {
+                    uint64_t first_block_num)
+{
     fseek(encrypted_fp, first_block_num * (WIDE_BLOCK_SIZE), SEEK_SET);
     return fread(blocks, 1, size, encrypted_fp);
 }
 
 static int
 write_block_sequence(const uint8_t *blocks, size_t size,
-                     uint64_t first_block_num) {
+                     uint64_t first_block_num)
+{
     fseek(encrypted_fp, first_block_num * (WIDE_BLOCK_SIZE), SEEK_SET);
     return fwrite(blocks, 1, size, encrypted_fp);
 }
@@ -250,7 +257,8 @@ write_block_sequence(const uint8_t *blocks, size_t size,
 
 static int
 readdir_callback(const char *path, void *buf, fuse_fill_dir_t filler,
-                 off_t offset, struct fuse_file_info *fi) {
+                 off_t offset, struct fuse_file_info *fi)
+{
     (void) offset;
     (void) fi;
 
@@ -263,7 +271,8 @@ readdir_callback(const char *path, void *buf, fuse_fill_dir_t filler,
 }
 
 static int
-getattr_callback(const char *path, struct stat *stbuf) {
+getattr_callback(const char *path, struct stat *stbuf)
+{
     memset(stbuf, 0, sizeof(struct stat));
 
     if (strcmp(path, "/") == 0) {
@@ -283,14 +292,16 @@ getattr_callback(const char *path, struct stat *stbuf) {
 }
 
 static int
-open_callback(const char *path, struct fuse_file_info *fi) {
+open_callback(const char *path, struct fuse_file_info *fi)
+{
     return 0;
 }
 
 static int
-read_callback(const char *path, char *buf, size_t size,
-              off_t offset, struct fuse_file_info *fi) {
-
+read_write(const char *path, char *buf, size_t size,
+           off_t offset, struct fuse_file_info *fi,
+           int mode)
+{
     if (strcmp(path, "/" PLAIN_FILENAME) == 0) {
 
         off_t len = encrypted_stat.st_size - sizeof(nonce);
@@ -325,6 +336,7 @@ read_callback(const char *path, char *buf, size_t size,
         /* read sequence of blocks */
 
         size_t ret = read_block_sequence(blocks, seq_size, first_block_num);
+
         if(ret != seq_size) {
             fprintf(stderr,
                     "read_block_sequence(): read only %lu out of %lu bytes",
@@ -332,12 +344,47 @@ read_callback(const char *path, char *buf, size_t size,
             return 0;
         }
 
-        /* decrypt sequence of blocks */
+        /* READ operation */
 
-        enc_dec_wide_block_sequence(blocks, seq_size, key1, key2,
-                                    first_block_num, MODE_DECRYPT);
+        if(mode == MODE_READ) {
 
-        memcpy(buf, blocks + (offset % (WIDE_BLOCK_SIZE)), size);
+            /* decrypt sequence of blocks */
+
+            enc_dec_wide_block_sequence(blocks, seq_size, key1, key2,
+                                        first_block_num, MODE_DECRYPT);
+
+            memcpy(buf, blocks + (offset % (WIDE_BLOCK_SIZE)), size);
+
+        }
+
+        /* WRITE operation */
+
+        else {
+
+            /* decrypt sequence of blocks */
+
+            enc_dec_wide_block_sequence(blocks, seq_size, key1, key2,
+                                        first_block_num, MODE_DECRYPT);
+
+            memcpy(blocks + (offset % (WIDE_BLOCK_SIZE)), buf, size);
+
+            /* re-encrypt sequence */
+
+            enc_dec_wide_block_sequence(blocks, seq_size, key1, key2,
+                                        first_block_num, MODE_ENCRYPT);
+
+            /* write it back in encrypted file */
+
+            ret = write_block_sequence(blocks, seq_size, first_block_num);
+
+            if(ret != seq_size) {
+                fprintf(stderr,
+                        "write_block_sequence(): written only %lu out of %lu bytes",
+                        ret, seq_size);
+                return 0;
+            }
+
+        }
 
         return size;
     }
@@ -346,76 +393,17 @@ read_callback(const char *path, char *buf, size_t size,
 }
 
 static int
+read_callback(const char *path, char *buf, size_t size,
+              off_t offset, struct fuse_file_info *fi)
+{
+    return read_write(path, buf, size, offset, fi, MODE_READ);
+}
+
+static int
 write_callback(const char *path, const char *buf, size_t size,
-               off_t offset, struct fuse_file_info *fi) {
-
-    if (strcmp(path, "/" PLAIN_FILENAME) == 0) {
-
-        off_t len = encrypted_stat.st_size - sizeof(nonce);
-
-        if (offset >= len) {
-            return 0;
-        }
-
-        if (offset + size > len) {
-            size = len - offset;
-            if(!size) return 0;
-        }
-
-        if(size > MAX_WIDE_BLOCK_SEQUENCE_SIZE) {
-            size = MAX_WIDE_BLOCK_SEQUENCE_SIZE;
-        }
-
-        /* allocate space for sequence */
-
-        // we add an extra block to handle unaligned reads:
-        uint8_t blocks[MAX_WIDE_BLOCK_SEQUENCE_SIZE + (WIDE_BLOCK_SIZE)];
-
-        uint64_t first_block_num = offset / (WIDE_BLOCK_SIZE);
-        size_t seq_size = size;
-
-        /* fill extra bytes to obtain a sequence length
-           which is a multiple of the block size */
-
-        if(size % (WIDE_BLOCK_SIZE) != 0)
-            seq_size += (WIDE_BLOCK_SIZE) - (size % (WIDE_BLOCK_SIZE));
-
-        /* read sequence of blocks */
-
-        size_t ret = read_block_sequence(blocks, seq_size, first_block_num);
-        if(ret != seq_size) {
-            fprintf(stderr,
-                    "read_block_sequence(): read only %lu out of %lu bytes",
-                    ret, seq_size);
-            return 0;
-        }
-
-        /* decrypt sequence of blocks */
-
-        enc_dec_wide_block_sequence(blocks, seq_size, key1, key2,
-                                    first_block_num, MODE_DECRYPT);
-
-        memcpy(blocks + (offset % (WIDE_BLOCK_SIZE)), buf, size);
-
-        /* re-encrypt sequence */
-
-        enc_dec_wide_block_sequence(blocks, seq_size, key1, key2,
-                               first_block_num, MODE_ENCRYPT);
-
-        /* write it back in encrypted file */
-
-        ret = write_block_sequence(blocks, seq_size, first_block_num);
-        if(ret != seq_size) {
-            fprintf(stderr,
-                    "write_block_sequence(): written only %lu out of %lu bytes",
-                    ret, seq_size);
-            return 0;
-        }
-
-        return size;
-    }
-
-    return -ENOENT;
+               off_t offset, struct fuse_file_info *fi)
+{
+    return read_write(path, (char *) buf, size, offset, fi, MODE_WRITE);
 }
 
 static struct fuse_operations callback_operations = {
