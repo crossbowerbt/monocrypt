@@ -144,23 +144,11 @@ xor_narrow_blocks(uint8_t dst[NARROW_BLOCK_SIZE],
 }
 
 static void
-xex2(uint8_t l[NARROW_BLOCK_SIZE],
-     const uint64_t j,
-     const uint8_t key1[KEY_SIZE],
-     const uint8_t key2[KEY_SIZE],
+xex2(const uint8_t key1[KEY_SIZE],
+     uint8_t delta[NARROW_BLOCK_SIZE],
      uint8_t narrow_block[NARROW_BLOCK_SIZE],
      int mode)
 {
-    uint64_t alpha = 2;
-
-    uint8_t delta[NARROW_BLOCK_SIZE];
-    uint8_t tweak[NARROW_BLOCK_SIZE];
-
-    // delta = l * (alpha ** j)
-
-    uint64_to_narrow_block(tweak, alpha << j);
-    xor_narrow_blocks(delta, l, tweak);
-
     // aes(key1, narrow_block ^ delta) ^ delta
 
     xor_narrow_blocks(narrow_block, narrow_block, delta);
@@ -171,6 +159,24 @@ xex2(uint8_t l[NARROW_BLOCK_SIZE],
         dec_block(narrow_block, narrow_block, key1);
 
     xor_narrow_blocks(narrow_block, narrow_block, delta);
+}
+
+static void
+update_delta(uint8_t delta[NARROW_BLOCK_SIZE])
+{
+    // delta = delta * 2 (using galois{128} multiplication)
+
+    int i = 0;
+    uint8_t carry = 0, carry_tmp = 0;
+
+    for (i=0; i<NARROW_BLOCK_SIZE; i++) {
+        carry_tmp = (delta[i]>>7) & 1;
+        delta[i] = ((delta[i]<<1) + carry) & 0xff;
+        carry = carry_tmp;
+    }
+
+    delta[0] ^= 0x87 * carry;
+
 }
 
 /*
@@ -184,20 +190,24 @@ xts(const uint64_t i,
     uint8_t wide_block[WIDE_BLOCK_SIZE],
     int mode)
 {
-    uint8_t l[NARROW_BLOCK_SIZE];
+    uint8_t delta[NARROW_BLOCK_SIZE];
     int j;
 
-    /* l = aes(key2, i) */
+    /* delta = aes(key2, i) */
 
-    uint64_to_narrow_block(l, i);
-    enc_block(l, l, key2);
+    uint64_to_narrow_block(delta, i);
+    enc_block(delta, delta, key2);
 
     for(j = 0; j < (WIDE_BLOCK_SIZE/NARROW_BLOCK_SIZE); j++) {
 
         uint8_t *narrow_block;
 
         narrow_block = &wide_block[j * NARROW_BLOCK_SIZE];
-        xex2(l, j, key1, key2, narrow_block, mode);
+        xex2(l, j, key1, key2, narrow_block, delta, mode);
+
+        /* delta = delta * 2 (using galois{128} multiplication) */
+
+        update_delta(delta);
 
     }
 }
